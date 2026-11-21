@@ -1,14 +1,34 @@
-import os
+import json
+import re
 import time
 import random
+import urllib.parse
+import urllib.request
 from datetime import datetime
 import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="Tell Me What to Check — HCI Study", layout="centered")
 
-DATA_DIR = "study_logs"
-os.makedirs(DATA_DIR, exist_ok=True)
+GOOGLE_FORM_URL = (
+    "https://docs.google.com/forms/d/e/"
+    "1FAIpQLSfSRSMFqL8R0ULg5HKLwvCZZ5V8c-bJfJn6rPBimkfFPx9otQ/formResponse"
+)
+
+FIELD_MAP = {
+    "participant_id": "entry.1017657753",
+    "record_type": "entry.890702658",
+    "item_id": "entry.990599375",
+    "domain": "entry.563673759",
+    "signal_arm": "entry.685208798",
+    "ai_is_correct": "entry.281299658",
+    "user_initial_answer": "entry.331361269",
+    "user_initial_correct": "entry.555308524",
+    "verified_clicked": "entry.2077279791",
+    "final_decision": "entry.205503851",
+    "final_correct": "entry.88238036",
+    "survey_summary": "entry.2119949638",
+}
 
 CELLS = [
     ("Correct", "None"),
@@ -31,40 +51,29 @@ HEDGE_PHRASES = [
 ]
 
 
+@st.cache_data
 def load_stimuli() -> pd.DataFrame:
     return pd.read_csv("stimuli.csv")
 
 
-def generate_quick_demo_schedule(stimuli_df: pd.DataFrame) -> list:
-    """4-trial demo showcasing one example of each warning style."""
-    demo_specs = [
-        (0, "Correct", "None", False),
-        (1, "Wrong", "Hedge", True),
-        (2, "Wrong", "Badge", True),
-        (3, "Wrong", "Caveat", True),
-    ]
-    trials = []
-    for row_idx, correctness, signal_arm, flagged in demo_specs:
-        row = stimuli_df.iloc[row_idx]
-        ai_text = (
-            row["correct_answer"] if correctness == "Correct" else row["wrong_answer"]
-        )
-        trials.append(
-            {
-                "item_id": int(row["id"]),
-                "domain": row["domain"],
-                "question": row["question"],
-                "ground_truth": row["ground_truth"],
-                "version": correctness,
-                "signal_arm": signal_arm,
-                "flagged": flagged,
-                "ai_text": ai_text,
-                "hedge_line": row["hedge_line"],
-                "badge_text": row["badge_text"],
-                "caveat_line": row["caveat_line"],
-            }
-        )
-    return trials
+def log_row_to_google_sheet(row_data: dict) -> bool:
+    """Silently posts a single trial or survey row to the linked Google Form/Sheet."""
+    payload = {
+        field_id: str(row_data.get(col_name, ""))
+        for col_name, field_id in FIELD_MAP.items()
+    }
+    encoded = urllib.parse.urlencode(payload).encode("utf-8")
+    req = urllib.request.Request(
+        GOOGLE_FORM_URL,
+        data=encoded,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
 
 
 def generate_participant_schedule(stimuli_df: pd.DataFrame, participant_num: int) -> list:
@@ -77,14 +86,14 @@ def generate_participant_schedule(stimuli_df: pd.DataFrame, participant_num: int
     for idx, row in stimuli_df.iterrows():
         cell_idx = (idx + participant_num) % 8
         correctness, signal_arm = CELLS[cell_idx]
-        slot = (idx // 8) % 3  # 0, 1, or 2 across the 3 items per cell
+        slot = (idx // 8) % 3
 
         if signal_arm == "None":
             flagged = False
         elif correctness == "Wrong":
-            flagged = slot in (0, 1)  # Fires on 2 of 3 wrong answers
+            flagged = slot in (0, 1)
         else:
-            flagged = slot == 0  # Fires on 1 of 3 correct answers
+            flagged = slot == 0
 
         ai_text = (
             row["correct_answer"] if correctness == "Correct" else row["wrong_answer"]
@@ -95,7 +104,7 @@ def generate_participant_schedule(stimuli_df: pd.DataFrame, participant_num: int
                 "item_id": int(row["id"]),
                 "domain": row["domain"],
                 "question": row["question"],
-                "ground_truth": row["ground_truth"],
+                "ground_truth": str(row["ground_truth"]),
                 "version": correctness,
                 "signal_arm": signal_arm,
                 "flagged": flagged,
@@ -143,6 +152,26 @@ def render_ai_box(trial: dict):
     st.markdown(box_html, unsafe_allow_html=True)
 
 
+def check_initial_correct(guess: str, ground_truth: str) -> int:
+    """Normalizes minor formatting differences (e.g. '35' vs '35 years', '100' vs '100°C')."""
+    def clean(text: str) -> str:
+        t = text.lower().strip()
+        t = t.replace("°c", "").replace("°", "")
+        t = re.sub(r"[^\w\s]", "", t)
+        t = re.sub(r"\b(years|year|spokes|lord|mount|mt|the)\b", "", t)
+        return " ".join(t.split())
+
+    g = clean(guess)
+    gt = clean(ground_truth)
+    if not g or g in ("dont know", "idk", "na", "none", "unsure"):
+        return 0
+    if g == gt:
+        return 1
+    if len(gt) >= 3 and gt in g:
+        return 1
+    return 0
+
+
 def score_appropriate_reliance(version: str, decision: str) -> int:
     """1 = Appropriate reliance (Accept if Correct; Verify/Reject if Wrong), 0 = Otherwise."""
     if version == "Correct":
@@ -150,11 +179,16 @@ def score_appropriate_reliance(version: str, decision: str) -> int:
     return 1 if decision in ("Verify", "Reject") else 0
 
 
+def format_signal_label(trial: dict) -> str:
+    if trial["signal_arm"] == "None":
+        return "None"
+    return f"{trial['signal_arm']} (Shown)" if trial["flagged"] else f"{trial['signal_arm']} (Hidden)"
+
+
 # Initialize session state
 if "stage" not in st.session_state:
     st.session_state.stage = "welcome"
     st.session_state.trial_idx = 0
-    st.session_state.logs = []
     st.session_state.stage_start = time.time()
 
 
@@ -162,41 +196,26 @@ if "stage" not in st.session_state:
 if st.session_state.stage == "welcome":
     st.title("AI Fact-Checking & Reliance Study")
     st.write(
-        "In this study, you will answer short factual questions from memory and then "
+        "In this study, you will answer 24 short factual questions from memory and then "
         "evaluate responses generated by an AI assistant."
     )
     st.info(
         "**Instructions:** Please answer strictly from memory—do not search online "
-        "or use external references. The full session takes about 15–20 minutes."
+        "or use external references. The session takes about 10–15 minutes."
     )
 
-    p_id = st.text_input("Participant ID (e.g., P01, DEMO01):", value="DEMO01").strip()
-    run_mode = st.radio(
-        "Session Mode:",
-        [
-            "Quick Demo (4 Trials — 1 per signal type)",
-            "Full Study (24 Trials — Counterbalanced 2x4 Design)",
-        ],
-    )
     consent = st.checkbox(
         "I consent to participate and have my anonymous responses recorded."
     )
 
-    if st.button("Start Study", disabled=not (p_id and consent)):
-        digits = "".join(ch for ch in p_id if ch.isdigit())
-        p_num = int(digits) if digits else abs(hash(p_id)) % 100
+    if st.button("Start Quiz", disabled=not consent, type="primary"):
+        p_num = random.randint(1000, 9999)
         stimuli_df = load_stimuli()
 
-        st.session_state.participant_id = p_id
+        st.session_state.participant_id = f"P-{p_num}"
         st.session_state.participant_num = p_num
-        st.session_state.run_mode = run_mode
-        if run_mode.startswith("Quick Demo"):
-            st.session_state.trials = generate_quick_demo_schedule(stimuli_df)
-        else:
-            st.session_state.trials = generate_participant_schedule(stimuli_df, p_num)
-
+        st.session_state.trials = generate_participant_schedule(stimuli_df, p_num)
         st.session_state.trial_idx = 0
-        st.session_state.logs = []
         st.session_state.stage = "recall"
         st.session_state.stage_start = time.time()
         st.rerun()
@@ -261,27 +280,27 @@ elif st.session_state.stage == "decision":
 
     if chosen in ("Accept", "Reject"):
         decision_time = round(time.time() - st.session_state.stage_start, 2)
-        st.session_state.logs.append(
+        ans = st.session_state.current_recall["user_initial_answer"]
+        conf = st.session_state.current_recall["initial_confidence"]
+        t_rec = st.session_state.current_recall["time_recall_sec"]
+
+        log_row_to_google_sheet(
             {
                 "participant_id": st.session_state.participant_id,
-                "trial_num": idx + 1,
+                "record_type": "trial",
                 "item_id": trial["item_id"],
                 "domain": trial["domain"],
-                "version": trial["version"],
-                "signal_arm": trial["signal_arm"],
-                "flagged": int(trial["flagged"]),
-                "user_initial_answer": st.session_state.current_recall["user_initial_answer"],
-                "initial_confidence": st.session_state.current_recall["initial_confidence"],
-                "initial_decision": chosen,
-                "verify_snippet_opened": 0,
+                "signal_arm": format_signal_label(trial),
+                "ai_is_correct": trial["version"],
+                "user_initial_answer": f"{ans} (conf:{conf}/7)",
+                "user_initial_correct": check_initial_correct(ans, trial["ground_truth"]),
+                "verified_clicked": 0,
                 "final_decision": chosen,
-                "decision_changed": 0,
-                "decision_correct": score_appropriate_reliance(trial["version"], chosen),
-                "time_recall_sec": st.session_state.current_recall["time_recall_sec"],
-                "time_decision_sec": decision_time,
-                "time_verify_sec": 0.0,
+                "final_correct": score_appropriate_reliance(trial["version"], chosen),
+                "survey_summary": f"trial={idx + 1}; init={chosen}; t_rec={t_rec}s; t_dec={decision_time}s",
             }
         )
+
         if idx + 1 < total:
             st.session_state.trial_idx += 1
             st.session_state.stage = "recall"
@@ -325,27 +344,31 @@ elif st.session_state.stage == "verify_snippet":
 
     if final_choice:
         verify_time = round(time.time() - st.session_state.stage_start, 2)
-        st.session_state.logs.append(
+        ans = st.session_state.current_recall["user_initial_answer"]
+        conf = st.session_state.current_recall["initial_confidence"]
+        t_rec = st.session_state.current_recall["time_recall_sec"]
+        t_dec = st.session_state.decision_time_pre_verify
+
+        log_row_to_google_sheet(
             {
                 "participant_id": st.session_state.participant_id,
-                "trial_num": idx + 1,
+                "record_type": "trial",
                 "item_id": trial["item_id"],
                 "domain": trial["domain"],
-                "version": trial["version"],
-                "signal_arm": trial["signal_arm"],
-                "flagged": int(trial["flagged"]),
-                "user_initial_answer": st.session_state.current_recall["user_initial_answer"],
-                "initial_confidence": st.session_state.current_recall["initial_confidence"],
-                "initial_decision": "Verify",
-                "verify_snippet_opened": 1,
+                "signal_arm": format_signal_label(trial),
+                "ai_is_correct": trial["version"],
+                "user_initial_answer": f"{ans} (conf:{conf}/7)",
+                "user_initial_correct": check_initial_correct(ans, trial["ground_truth"]),
+                "verified_clicked": 1,
                 "final_decision": final_choice,
-                "decision_changed": 1,
-                "decision_correct": score_appropriate_reliance(trial["version"], "Verify"),
-                "time_recall_sec": st.session_state.current_recall["time_recall_sec"],
-                "time_decision_sec": st.session_state.decision_time_pre_verify,
-                "time_verify_sec": verify_time,
+                "final_correct": score_appropriate_reliance(trial["version"], "Verify"),
+                "survey_summary": (
+                    f"trial={idx + 1}; init=Verify; t_rec={t_rec}s; "
+                    f"t_dec={t_dec}s; t_ver={verify_time}s"
+                ),
             }
         )
+
         if idx + 1 < total:
             st.session_state.trial_idx += 1
             st.session_state.stage = "recall"
@@ -399,18 +422,9 @@ elif st.session_state.stage == "survey":
             f'"{phrase}"', 0, 100, 50, key=f"rq3_{phrase}"
         )
 
-    if st.button("Finish & Save Responses", disabled=not native_lang.strip()):
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        pid = st.session_state.participant_id
-
-        trials_out = pd.DataFrame(st.session_state.logs)
-        trials_path = f"{DATA_DIR}/{pid}_{ts}_trials.csv"
-        trials_out.to_csv(trials_path, index=False)
-
-        survey_row = {
-            "participant_id": pid,
-            "mode": st.session_state.run_mode,
-            "timestamp": ts,
+    if st.button("Submit Final Responses", disabled=not native_lang.strip(), type="primary"):
+        survey_payload = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "useful_hedge": useful_hedge,
             "annoy_hedge": annoy_hedge,
             "useful_badge": useful_badge,
@@ -421,47 +435,25 @@ elif st.session_state.stage == "survey":
             "native_language": native_lang.strip(),
             "english_comfort": english_comfort,
             "ai_use_frequency": ai_freq,
+            "rq3": rq3_ratings,
         }
-        for phrase, val in rq3_ratings.items():
-            survey_row[f"rq3_{phrase}"] = val
 
-        survey_out = pd.DataFrame([survey_row])
-        survey_path = f"{DATA_DIR}/{pid}_{ts}_survey.csv"
-        survey_out.to_csv(survey_path, index=False)
+        log_row_to_google_sheet(
+            {
+                "participant_id": st.session_state.participant_id,
+                "record_type": "survey",
+                "survey_summary": json.dumps(survey_payload),
+            }
+        )
 
-        st.session_state.saved_trials_csv = trials_out.to_csv(index=False)
-        st.session_state.saved_survey_csv = survey_out.to_csv(index=False)
-        st.session_state.saved_prefix = f"{pid}_{ts}"
         st.session_state.stage = "done"
         st.rerun()
 
 
-# --- STAGE 4: COMPLETION & DATA PREVIEW ---
+# --- STAGE 4: COMPLETION ---
 elif st.session_state.stage == "done":
-    st.success("Thank you! Your responses have been saved to the `study_logs/` folder.")
-    st.write("You can also download or inspect the logged data directly below:")
-
-    col_a, col_b = st.columns(2)
-    col_a.download_button(
-        label="Download Trials CSV",
-        data=st.session_state.saved_trials_csv,
-        file_name=f"{st.session_state.saved_prefix}_trials.csv",
-        mime="text/csv",
-        use_container_width=True,
+    st.title("Study Complete")
+    st.success(
+        "Thank you for participating! Your responses have been recorded automatically. "
+        "You may now close this browser tab."
     )
-    col_b.download_button(
-        label="Download Survey CSV",
-        data=st.session_state.saved_survey_csv,
-        file_name=f"{st.session_state.saved_prefix}_survey.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-    st.subheader("Logged Trial Data Preview")
-    st.dataframe(pd.DataFrame(st.session_state.logs))
-
-    if st.button("Restart / Run Another Session"):
-        st.session_state.stage = "welcome"
-        st.session_state.trial_idx = 0
-        st.session_state.logs = []
-        st.rerun()
