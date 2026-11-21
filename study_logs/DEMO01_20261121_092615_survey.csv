@@ -1,2 +1,0 @@
-participant_id,mode,timestamp,useful_hedge,annoy_hedge,useful_badge,annoy_badge,useful_caveat,annoy_caveat,trust_overall,native_language,english_comfort,ai_use_frequency,rq3_I'm not sure about this.,rq3_I think this is right.,rq3_It is likely true.,rq3_Probably.,rq3_It seems to be the case.,rq3_Possibly.
-DEMO01,Quick Demo (4 Trials — 1 per signal type),20261121_092615,4,4,4,4,4,4,4,Hindi,6,Daily,50,50,50,50,50,50

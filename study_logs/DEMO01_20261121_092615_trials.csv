@@ -1,5 +1,0 @@
-participant_id,trial_num,item_id,domain,version,signal_arm,flagged,user_initial_answer,initial_confidence,initial_decision,verify_snippet_opened,final_decision,decision_changed,decision_correct,time_recall_sec,time_decision_sec,time_verify_sec
-DEMO01,1,1,World Geography,Correct,None,0,Yangon,4,Verify,1,Accept,1,0,54.17,8.32,8.81
-DEMO01,2,2,Indian History & Civics,Wrong,Hedge,1,dont know,4,Verify,1,Accept,1,1,20.07,6.17,4.26
-DEMO01,3,3,Indian History & Civics,Wrong,Badge,1,Not sure,4,Accept,0,Accept,0,0,10.91,3.75,0.0
-DEMO01,4,4,World Geography,Wrong,Caveat,1,chilka,4,Verify,1,Accept,1,1,9.16,8.51,3.36
